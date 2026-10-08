@@ -155,6 +155,22 @@ func (s *Store) Join(ctx context.Context, uid, id int64) (*Room, error) {
 	return s.hydrate(ctx, id)
 }
 
+// Members returns the current member user ids for targeted socket delivery.
+// Room messages/retracts go only to these users, never a global broadcast.
+func (s *Store) Members(ctx context.Context, id int64) []int64 {
+	raw, err := s.rdb.SMembers(ctx, membersKey(id)).Result()
+	if err != nil {
+		return nil
+	}
+	out := make([]int64, 0, len(raw))
+	for _, sp := range raw {
+		if uid, err := strconv.ParseInt(sp, 10, 64); err == nil {
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
 func (s *Store) GetMessages(ctx context.Context, uid, id int64) ([]Message, error) {
 	if err := s.requireOnline(ctx, uid); err != nil {
 		return nil, err

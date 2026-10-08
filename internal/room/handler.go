@@ -139,7 +139,8 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
-	h.Hub.Broadcast(realtime.EvRoomMessage, msg)
+	// Targeted: only current members receive the message (not a broadcast).
+	h.Hub.SendToUsers(h.Store.Members(r.Context(), id), realtime.EvRoomMessage, msg)
 	writeJSON(w, http.StatusCreated, msg)
 }
 
@@ -155,8 +156,11 @@ func (h *Handler) Leave(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
+	// Message retracts go only to remaining members; room list changes
+	// (deleted/updated member count) stay global — they are rare.
+	members := h.Store.Members(r.Context(), id)
 	for _, message := range res.DeletedMessages {
-		h.Hub.Broadcast(realtime.EvRoomMessageRetracted, message)
+		h.Hub.SendToUsers(members, realtime.EvRoomMessageRetracted, message)
 	}
 	if len(res.DeletedRooms) > 0 {
 		h.Hub.Broadcast(realtime.EvRoomDeleted, map[string]any{"room_id": id})

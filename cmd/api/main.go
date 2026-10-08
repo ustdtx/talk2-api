@@ -86,7 +86,7 @@ func main() {
 			func(ctx context.Context, uid int64, username string) {
 				onOffline(ctx, hub, feedStore, dmStore, roomStore, uid, username)
 			})
-		feedStore = feed.NewStore(rdb, tracker, store, cfg.RateLimits)
+		feedStore = feed.NewStore(rdb, tracker, store, cfg.RateLimits, cfg.FeedMaxPosts, cfg.FeedBatchMinSec, cfg.FeedBatchMaxSec)
 		dmStore = dm.NewStore(rdb, tracker, store, cfg.RateLimits)
 		roomStore = room.NewStore(rdb, tracker)
 		go tracker.RunReaper(context.Background())
@@ -162,6 +162,7 @@ func main() {
 	}
 	mux.HandleFunc("POST /posts", requireFeed(feedH.CreatePost))
 	mux.HandleFunc("GET /feed", requireFeed(feedH.ListFeed))
+	mux.HandleFunc("GET /feed/batches", requireFeed(feedH.ListBatches))
 	mux.HandleFunc("GET /posts/{id}", requireFeed(feedH.GetPost))
 	mux.HandleFunc("DELETE /posts/{id}", requireFeed(feedH.DeletePost))
 	mux.HandleFunc("POST /posts/{id}/comments", requireFeed(feedH.AddComment))
@@ -345,6 +346,55 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "count": len(deleted)})
 	}))
 
+	// Feed timing loop: seal ticks + adaptive windows.
+	// Windows follow crowd size — short when quiet (fresh), long when packed
+	// (efficient). At most one window change per few minutes (no flapping);
+	// renumbering after a change is silent and clients rebase losslessly.
+	if feedStore != nil && tracker != nil {
+		go func() {
+			announced := feedStore.CurrentBatch() - 1
+			var lastWindowChange time.Time
+			tune := func() {
+				n, err := tracker.OnlineCount(context.Background())
+				if err != nil {
+					return
+				}
+				want := feed.DesiredWindow(n, cfg.FeedBatchMinSec, cfg.FeedBatchMaxSec)
+				if want == feedStore.WindowSec() {
+					return
+				}
+				if time.Since(lastWindowChange) < 3*time.Minute {
+					return
+				}
+				feedStore.SetWindowSec(want)
+				lastWindowChange = time.Now()
+				announced = feedStore.CurrentBatch() - 1
+				hub.Broadcast(realtime.EvFeedWindowChanged, map[string]any{"window_sec": want})
+				log.Printf("feed: window %ds for %d online", want, n)
+			}
+			tune()
+			sealTick := time.NewTicker(10 * time.Second)
+			defer sealTick.Stop()
+			tuneTick := time.NewTicker(30 * time.Second)
+			defer tuneTick.Stop()
+			for {
+				select {
+				case <-sealTick.C:
+					batch, ok := feedStore.SealCheck(context.Background(), announced)
+					if batch <= announced {
+						continue
+					}
+					announced = batch
+					if ok {
+						hub.Broadcast(realtime.EvFeedBatchSealed, map[string]any{"batch": batch})
+						log.Printf("feed: sealed batch %d", batch)
+					}
+				case <-tuneTick.C:
+					tune()
+				}
+			}
+		}()
+	}
 	// Nightly orphan sweeper (plan §11). Hourly tick, 24h age gate inside.
 	if rdb != nil {
 		go func() {
@@ -434,10 +484,11 @@ func onOffline(ctx context.Context, hub *realtime.Hub, fs *feed.Store, ds *dm.St
 	}
 	if ds != nil {
 		// Full thread wipe (plan decision 3): both directions die, the
-		// survivor gets dm:thread_retracted per counterpart.
+		// survivor gets dm:thread_retracted per counterpart — targeted to the
+		// survivor only, never a broadcast.
 		if parts, err := ds.WipeUser(ctx, uid); err == nil {
 			for _, vid := range parts {
-				hub.Broadcast(realtime.EvDMThreadRetr,
+				hub.SendToUser(vid, realtime.EvDMThreadRetr,
 					map[string]any{"with_user_id": uid, "for_user_id": vid})
 			}
 			if len(parts) > 0 {
@@ -449,8 +500,17 @@ func onOffline(ctx context.Context, hub *realtime.Hub, fs *feed.Store, ds *dm.St
 	}
 	if rs != nil {
 		if wiped, err := rs.WipeUser(ctx, uid); err == nil {
+			// Message retracts go only to remaining members of each room.
+			// Deleted/updated room list events stay global (rare).
+			byRoom := map[int64][]int64{}
+			for _, roomID := range wiped.RoomIDs {
+				if containsInt64(wiped.DeletedRooms, roomID) {
+					continue
+				}
+				byRoom[roomID] = rs.Members(ctx, roomID)
+			}
 			for _, message := range wiped.DeletedMessages {
-				hub.Broadcast(realtime.EvRoomMessageRetracted, message)
+				hub.SendToUsers(byRoom[message.RoomID], realtime.EvRoomMessageRetracted, message)
 			}
 			for _, roomID := range wiped.DeletedRooms {
 				hub.Broadcast(realtime.EvRoomDeleted, map[string]any{"room_id": roomID})
