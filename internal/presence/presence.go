@@ -80,6 +80,12 @@ func (t *Tracker) IsOnline(ctx context.Context, uid int64) (bool, error) {
 	return n > 0, err
 }
 
+// OnlineCount is the cheap crowd size for adaptive tuning (set cardinality
+// only — no hydration). Exact membership still comes from ListOnline.
+func (t *Tracker) OnlineCount(ctx context.Context) (int64, error) {
+	return t.rdb.SCard(ctx, onlineSet).Result()
+}
+
 // MarkOffline removes presence. Returns the last known username ("" if none).
 func (t *Tracker) MarkOffline(ctx context.Context, uid int64) string {
 	username, _ := t.rdb.Get(ctx, nameKey(uid)).Result()

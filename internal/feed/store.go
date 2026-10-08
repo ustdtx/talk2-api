@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -105,10 +106,84 @@ type Store struct {
 	// rateLimits gates the post/comment throttles (RATE_LIMITS_ENABLED).
 	// Dev sets false; prod keeps true. The checks stay in code, just skipped.
 	rateLimits bool
+	// maxPosts caps feed:global. Write pressure itself bounds memory: every
+	// create trims oldest-first past the cap (full cascade incl. R2).
+	// Tune via FEED_MAX_POSTS (lower it when the box is hot).
+	maxPosts int
+	// windowSec groups posts into time batches: batch n owns created_ms in
+	// [n*window, (n+1)*window), clock-aligned. Windows seal by the timer;
+	// empty windows create nothing, and windows whose posts all died (0 live
+	// entries) are dropped — batch existence is derived, never stored.
+	// The live window follows crowd size (see DesiredWindow): short when
+	// quiet (fresh), long when packed (efficient).
+	minWinSec int64
+	maxWinSec int64
+	curWinSec atomic.Int64
 }
 
-func NewStore(rdb *redis.Client, p *presence.Tracker, m media.Storage, rateLimits bool) *Store {
-	return &Store{rdb: rdb, presence: p, media: m, rateLimits: rateLimits}
+func NewStore(rdb *redis.Client, p *presence.Tracker, m media.Storage, rateLimits bool, maxPosts int, minWinSec, maxWinSec int64) *Store {
+	if maxPosts <= 0 {
+		maxPosts = 300
+	}
+	if minWinSec <= 0 {
+		minWinSec = 15
+	}
+	if maxWinSec < minWinSec {
+		maxWinSec = minWinSec
+	}
+	s := &Store{rdb: rdb, presence: p, media: m, rateLimits: rateLimits,
+		maxPosts: maxPosts, minWinSec: minWinSec, maxWinSec: maxWinSec}
+	s.curWinSec.Store(minWinSec)
+	return s
+}
+
+// WindowSec is the live window length in seconds.
+func (s *Store) WindowSec() int64 { return s.curWinSec.Load() }
+
+// SetWindowSec moves the live window, clamped to [min, max].
+func (s *Store) SetWindowSec(v int64) {
+	if v < s.minWinSec {
+		v = s.minWinSec
+	}
+	if v > s.maxWinSec {
+		v = s.maxWinSec
+	}
+	s.curWinSec.Store(v)
+}
+
+// windowTiers maps online users -> window seconds: quiet crowds get fresh
+// (short) windows, packed crowds get efficient (long) ones.
+var windowTiers = [][2]int64{{20, 15}, {100, 30}, {500, 60}, {2000, 120}, {1 << 62, 300}}
+
+// DesiredWindow picks the tier window for n online users, clamped to min/max.
+func DesiredWindow(online, minSec, maxSec int64) int64 {
+	w := windowTiers[len(windowTiers)-1][1]
+	for _, t := range windowTiers {
+		if online < t[0] {
+			w = t[1]
+			break
+		}
+	}
+	if w < minSec {
+		w = minSec
+	}
+	if w > maxSec {
+		w = maxSec
+	}
+	return w
+}
+
+func (s *Store) windowMs() int64 { return s.WindowSec() * 1000 }
+
+// batchWindow returns the [start, end) created_ms for batch n.
+func (s *Store) batchWindow(n int64) (int64, int64) {
+	w := s.windowMs()
+	return n * w, (n + 1) * w
+}
+
+// CurrentBatch is the still-open window (withheld from clients until sealed).
+func (s *Store) CurrentBatch() int64 {
+	return time.Now().UnixMilli() / s.windowMs()
 }
 
 func pad(id int64) string { return fmt.Sprintf("%019d", id) }
@@ -236,9 +311,38 @@ func (s *Store) CreatePost(ctx context.Context, uid int64, username, text string
 	for _, k := range imgKeys {
 		media.MarkAttached(ctx, s.rdb, k, "posts", id2s(id))
 	}
+	// Cap growth on the write path (best-effort): oldest die first.
+	s.trimExcess(ctx)
 	return &Post{ID: id, AuthorID: uid, AuthorUsername: username, Text: t,
 		Images:    decodeImages(imgs, s.media.PublicURL),
 		CreatedAt: iso(now)}, nil
+}
+
+// trimExcess deletes oldest-first everything past maxPosts: post + thread +
+// R2 bytes. ZSET ties (same ms) order by zero-padded member, so ZRange head
+// is always the true oldest. Runs after every create, so hot writers trim
+// faster — the cap is the load lever (lower FEED_MAX_POSTS when hot).
+func (s *Store) trimExcess(ctx context.Context) {
+	total, err := s.rdb.ZCard(ctx, "feed:global").Result()
+	if err != nil || total <= int64(s.maxPosts) {
+		return
+	}
+	excess := total - int64(s.maxPosts)
+	oldest, err := s.rdb.ZRange(ctx, "feed:global", 0, excess-1).Result()
+	if err != nil {
+		return
+	}
+	for _, m := range oldest {
+		id, err := strconv.ParseInt(strings.TrimLeft(m, "0"), 10, 64)
+		if err != nil || id == 0 {
+			continue
+		}
+		if p, ok := s.getPost(ctx, id); ok {
+			_, _ = s.deletePostCascade(ctx, p)
+		} else {
+			_, _ = s.rdb.ZRem(ctx, "feed:global", m).Result()
+		}
+	}
 }
 
 func id2s(id int64) string { return strconv.FormatInt(id, 10) }
@@ -296,6 +400,143 @@ func (s *Store) ListFeed(ctx context.Context, limit int, beforeID int64) ([]Post
 			}
 		}
 		// Short page = exhausted.
+		if len(members) < feedBatch {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ListFeedAfter is the legacy id cursor (kept for compat).
+
+// BatchResult is one scroll batch: the live posts sealed in that time
+// window plus whether the window had closed (incomplete windows are withheld
+// so every client walks the same full batches in order).
+type BatchResult struct {
+	Posts    []Post
+	Batch    int64
+	Complete bool
+}
+
+// ListBatch returns batch n oldest-first, currently-online authors only.
+// The open window and unknown windows return Complete=false with no posts;
+// sealed-but-empty windows return Complete=true with no posts (skipped
+// client-side, same as deleted).
+func (s *Store) ListBatch(ctx context.Context, n int64) (*BatchResult, error) {
+	if n < 0 || n >= s.CurrentBatch() {
+		return &BatchResult{Batch: n}, nil
+	}
+	start, end := s.batchWindow(n)
+	members, err := s.rdb.ZRangeByScore(ctx, "feed:global", &redis.ZRangeBy{
+		Min: strconv.FormatInt(start, 10),
+		Max: "(" + strconv.FormatInt(end, 10),
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	online := s.onlineSet(ctx)
+	out := make([]Post, 0, len(members))
+	for _, m := range members {
+		id, err := strconv.ParseInt(strings.TrimLeft(m, "0"), 10, 64)
+		if err != nil || id == 0 {
+			continue
+		}
+		p, ok := s.getPost(ctx, id)
+		if !ok || !online[p.AuthorID] {
+			continue
+		}
+		p.CommentCount = s.commentCount(ctx, id)
+		out = append(out, *p)
+	}
+	return &BatchResult{Posts: out, Batch: n, Complete: true}, nil
+}
+
+// ListBatches returns sealed, non-empty batch ids ascending — scores only, no
+// hydration. Empty windows create nothing; fully-dead windows drop out.
+func (s *Store) ListBatches(ctx context.Context) ([]int64, error) {
+	members, err := s.rdb.ZRangeWithScores(ctx, "feed:global", 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	open := s.CurrentBatch()
+	seen := map[int64]bool{}
+	out := []int64{}
+	for _, z := range members {
+		n := int64(z.Score) / s.windowMs()
+		if n >= open || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// SealCheck looks at the window that just closed: it returns that window and
+// whether it holds posts. Callers announce each seal exactly once by tracking
+// the last returned window; empty seals advance silently (no batch created).
+func (s *Store) SealCheck(ctx context.Context, afterBatch int64) (batch int64, hasPosts bool) {
+	target := s.CurrentBatch() - 1
+	if target <= afterBatch || target < 0 {
+		return -1, false
+	}
+	start, end := s.batchWindow(target)
+	n, err := s.rdb.ZCount(ctx, "feed:global",
+		strconv.FormatInt(start, 10), "("+strconv.FormatInt(end, 10)).Result()
+	if err != nil || n == 0 {
+		return target, false
+	}
+	return target, true
+}
+
+// oldest-first, currently-online authors only. IDs are time-ordered
+// (INCR + created_ms score), so the id cursor is the timestamp cursor.
+// afterID <= 0 returns empty — history uses ListFeed/before instead.
+func (s *Store) ListFeedAfter(ctx context.Context, limit int, afterID int64) ([]Post, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	if afterID <= 0 {
+		return []Post{}, nil
+	}
+	total, err := s.rdb.ZCard(ctx, "feed:global").Result()
+	if err != nil {
+		return nil, err
+	}
+	online := s.onlineSet(ctx)
+	out := make([]Post, 0, limit)
+	var offset int64
+	for int64(len(out)) < int64(limit) && offset < total {
+		end := offset + feedBatch - 1
+		if end >= total {
+			end = total - 1
+		}
+		members, err := s.rdb.ZRange(ctx, "feed:global", offset, end).Result()
+		if err != nil {
+			return nil, err
+		}
+		if len(members) == 0 {
+			break
+		}
+		offset += int64(len(members))
+		for _, m := range members {
+			id, err := strconv.ParseInt(strings.TrimLeft(m, "0"), 10, 64)
+			if err != nil || id == 0 || id <= afterID {
+				continue
+			}
+			p, ok := s.getPost(ctx, id)
+			if !ok {
+				continue
+			}
+			if !online[p.AuthorID] {
+				continue
+			}
+			p.CommentCount = s.commentCount(ctx, id)
+			out = append(out, *p)
+			if len(out) >= limit {
+				break
+			}
+		}
 		if len(members) < feedBatch {
 			break
 		}

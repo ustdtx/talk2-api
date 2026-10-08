@@ -64,8 +64,9 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Canonical per plan §7 is dm:receive; dm:new kept as compat alias.
-	h.Hub.Broadcast(realtime.EvDMReceive, m)
-	h.Hub.Broadcast(realtime.EvDMNew, m)
+	// Targeted: only the 2 participants ever receive it (not a broadcast).
+	h.Hub.SendToUsers([]int64{claims.UserID, b.ToUserID}, realtime.EvDMReceive, m)
+	h.Hub.SendToUsers([]int64{claims.UserID, b.ToUserID}, realtime.EvDMNew, m)
 	writeJSON(w, http.StatusCreated, m)
 }
 

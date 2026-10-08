@@ -61,12 +61,49 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 		mapStoreErr(w, err)
 		return
 	}
-	h.Hub.Broadcast(realtime.EvFeedNewPost, p)
+	// Pull-based feed (scale): no global feed:new_post push. The author gets
+	// the POST response (optimistic) and everyone else polls GET /feed.
+	// Retracts (delete/offline) are still pushed — they are rare.
 	writeJSON(w, http.StatusCreated, p)
 }
 
-// GET /feed?limit=&before=
+// GET /feed?limit=&before= (older history, newest-first),
+// GET /feed?limit=&after= (legacy id cursor, oldest-first), or
+// GET /feed?batch=n|latest (sealed time-window batches, oldest-first).
 func (h *Handler) ListFeed(w http.ResponseWriter, r *http.Request) {
+	if v := r.URL.Query().Get("batch"); v != "" {
+		var n int64 = -1
+		if v == "latest" {
+			if batches, err := h.Store.ListBatches(r.Context()); err == nil && len(batches) > 0 {
+				n = batches[len(batches)-1]
+			}
+			if n < 0 {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"posts": []Post{}, "batch": -1, "complete": false,
+				})
+				return
+			}
+		} else {
+			var err error
+			n, err = strconv.ParseInt(v, 10, 64)
+			if err != nil || n < 0 {
+				writeErr(w, http.StatusBadRequest, "bad batch number")
+				return
+			}
+		}
+		res, err := h.Store.ListBatch(r.Context(), n)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "feed unavailable")
+			return
+		}
+		if res.Posts == nil {
+			res.Posts = []Post{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"posts": res.Posts, "batch": res.Batch, "complete": res.Complete,
+		})
+		return
+	}
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -77,7 +114,17 @@ func (h *Handler) ListFeed(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("before"); v != "" {
 		before, _ = strconv.ParseInt(v, 10, 64)
 	}
-	posts, err := h.Store.ListFeed(r.Context(), limit, before)
+	var after int64
+	if v := r.URL.Query().Get("after"); v != "" {
+		after, _ = strconv.ParseInt(v, 10, 64)
+	}
+	var posts []Post
+	var err error
+	if after > 0 {
+		posts, err = h.Store.ListFeedAfter(r.Context(), limit, after)
+	} else {
+		posts, err = h.Store.ListFeed(r.Context(), limit, before)
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "feed unavailable")
 		return
@@ -86,6 +133,20 @@ func (h *Handler) ListFeed(w http.ResponseWriter, r *http.Request) {
 		posts = []Post{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"posts": posts})
+}
+
+// GET /feed/batches — sealed, non-empty batch ids ascending. The client
+// starts at n-2 (clamped to oldest) and walks n+1 down / n-1 up.
+func (h *Handler) ListBatches(w http.ResponseWriter, r *http.Request) {
+	batches, err := h.Store.ListBatches(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "feed unavailable")
+		return
+	}
+	if batches == nil {
+		batches = []int64{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"batches": batches})
 }
 
 // GET /posts/{id}
@@ -143,7 +204,8 @@ func (h *Handler) AddComment(w http.ResponseWriter, r *http.Request) {
 		mapStoreErr(w, err)
 		return
 	}
-	h.Hub.Broadcast(realtime.EvCommentNew, c)
+	// Pull-based threads (scale): no global comment:new push. Open threads
+	// poll GET /posts/{id}/comments; retracts are still pushed (rare).
 	writeJSON(w, http.StatusCreated, c)
 }
 

@@ -9,20 +9,23 @@ import (
 
 // Config holds everything TASK-0 needs. Later tasks extend this.
 type Config struct {
-	Port          string
-	DatabaseURL   string
-	RedisURL      string
-	JWTSecret     string
-	PresenceTTL   int // seconds a heartbeat keeps you online (default 60)
-	PresenceSweep int // reaper interval seconds (default 10)
-	RateLimits    bool // false disables all rate limits (dev); default true
-	CORSOrigins   string // comma-separated allowed browser origins
-	S3Bucket      string
-	S3Region      string
-	S3EndpointURL string
-	S3PublicURL   string
-	S3AccessKeyID string
-	S3SecretKey   string
+	Port            string
+	DatabaseURL     string
+	RedisURL        string
+	JWTSecret       string
+	PresenceTTL     int    // seconds a heartbeat keeps you online (default 60)
+	PresenceSweep   int    // reaper interval seconds (default 10)
+	RateLimits      bool   // false disables all rate limits (dev); default true
+	CORSOrigins     string // comma-separated allowed browser origins
+	FeedMaxPosts    int    // cap of live posts in feed:global (default 300)
+	FeedBatchMinSec int64  // shortest batch window: quiet crowds stay fresh (default 15)
+	FeedBatchMaxSec int64  // longest batch window: packed crowds stay efficient (default 300)
+	S3Bucket        string
+	S3Region        string
+	S3EndpointURL   string
+	S3PublicURL     string
+	S3AccessKeyID   string
+	S3SecretKey     string
 }
 
 func getenv(key, fallback string) string {
@@ -84,19 +87,22 @@ func LoadDotEnv(path string) {
 
 func Load() Config {
 	return Config{
-		Port:          getenv("PORT", "8080"),
-		DatabaseURL:   getenv("DATABASE_URL", ""),
-		RedisURL:      getenv("REDIS_URL", ""),
-		JWTSecret:     getenv("JWT_SECRET", ""),
-		PresenceTTL:   getenvInt("PRESENCE_TTL_SEC", 60),
-		PresenceSweep: getenvInt("PRESENCE_SWEEP_SEC", 10),
-		RateLimits:    getenvBool("RATE_LIMITS_ENABLED", true),
-		CORSOrigins:   getenv("CORS_ORIGINS", "http://localhost:3000"),
-		S3Bucket:      getenv("S3_BUCKET", ""),
-		S3Region:      getenv("S3_REGION", "auto"),
-		S3EndpointURL: getenv("S3_ENDPOINT_URL", ""),
-		S3PublicURL:   getenv("S3_PUBLIC_URL", ""),
-		S3AccessKeyID: getenv("S3_ACCESS_KEY_ID", ""),
-		S3SecretKey:   getenv("S3_SECRET_ACCESS_KEY", ""),
+		Port:            getenv("PORT", "8080"),
+		DatabaseURL:     getenv("DATABASE_URL", ""),
+		RedisURL:        getenv("REDIS_URL", ""),
+		JWTSecret:       getenv("JWT_SECRET", ""),
+		PresenceTTL:     getenvInt("PRESENCE_TTL_SEC", 60),
+		PresenceSweep:   getenvInt("PRESENCE_SWEEP_SEC", 10),
+		RateLimits:      getenvBool("RATE_LIMITS_ENABLED", true),
+		CORSOrigins:     getenv("CORS_ORIGINS", "http://localhost:3000"),
+		FeedMaxPosts:    getenvInt("FEED_MAX_POSTS", 300),
+		FeedBatchMinSec: int64(getenvInt("FEED_BATCH_MIN_SEC", 15)),
+		FeedBatchMaxSec: int64(getenvInt("FEED_BATCH_MAX_SEC", 300)),
+		S3Bucket:        getenv("S3_BUCKET", ""),
+		S3Region:        getenv("S3_REGION", "auto"),
+		S3EndpointURL:   getenv("S3_ENDPOINT_URL", ""),
+		S3PublicURL:     getenv("S3_PUBLIC_URL", ""),
+		S3AccessKeyID:   getenv("S3_ACCESS_KEY_ID", ""),
+		S3SecretKey:     getenv("S3_SECRET_ACCESS_KEY", ""),
 	}
 }

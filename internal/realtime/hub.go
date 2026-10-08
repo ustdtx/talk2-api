@@ -32,6 +32,8 @@ const (
 	EvError          = "error"
 
 	EvFeedNewPost          = "feed:new_post"
+	EvFeedBatchSealed      = "feed:batch_sealed"
+	EvFeedWindowChanged    = "feed:window_changed"
 	EvPostRetracted        = "post:retracted"
 	EvCommentNew           = "comment:new"
 	EvCommentRetracted     = "comment:retracted"
@@ -58,61 +60,132 @@ type Client struct {
 }
 
 type Hub struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	clients map[*Client]struct{}
+	byUser  map[int64]map[*Client]struct{}
 }
 
-func NewHub() *Hub { return &Hub{clients: map[*Client]struct{}{}} }
+func NewHub() *Hub {
+	return &Hub{clients: map[*Client]struct{}{}, byUser: map[int64]map[*Client]struct{}{}}
+}
 
 func (h *Hub) Add(c *Client) {
 	h.mu.Lock()
 	h.clients[c] = struct{}{}
+	if h.byUser[c.UserID] == nil {
+		h.byUser[c.UserID] = map[*Client]struct{}{}
+	}
+	h.byUser[c.UserID][c] = struct{}{}
 	h.mu.Unlock()
 }
 
 func (h *Hub) Remove(c *Client) {
 	h.mu.Lock()
 	delete(h.clients, c)
-	close(c.send)
+	if set, ok := h.byUser[c.UserID]; ok {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(h.byUser, c.UserID)
+		}
+	}
 	h.mu.Unlock()
+	// NOTE: send channel is intentionally NOT closed here. Broadcast /
+	// SendToUsers snapshot targets under RLock then deliver without holding
+	// the lock; closing here would race with in-flight delivers (panic on
+	// send to closed channel). The channel is GC'd after ctx teardown and
+	// each writeLoop exits via ctx.Done().
 }
 
 func (h *Hub) Count() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	return len(h.clients)
 }
 
 // DisconnectUser closes all sockets of a user (logout / account delete).
 // Map cleanup happens in each conn's deferred Remove; this only closes.
 func (h *Hub) DisconnectUser(uid int64, reason string) {
-	h.mu.Lock()
+	h.mu.RLock()
 	var targets []*Client
-	for c := range h.clients {
-		if c.UserID == uid {
-			targets = append(targets, c)
-		}
+	for c := range h.byUser[uid] {
+		targets = append(targets, c)
 	}
-	h.mu.Unlock()
+	h.mu.RUnlock()
 	for _, c := range targets {
 		_ = c.conn.Close(websocket.StatusNormalClosure, reason)
 	}
 }
 
+// snapshotAll copies targets so delivery never holds the lock while doing
+// up to N socket queue offers (100k-post storm safety).
+func (h *Hub) snapshotAll() []*Client {
+	h.mu.RLock()
+	out := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		out = append(out, c)
+	}
+	h.mu.RUnlock()
+	return out
+}
+
+func (h *Hub) snapshotUsers(userIDs []int64) []*Client {
+	h.mu.RLock()
+	// Dedupe ids; a user may hold several tabs/sockets.
+	seen := make(map[int64]struct{}, len(userIDs))
+	var out []*Client
+	for _, uid := range userIDs {
+		if _, dup := seen[uid]; dup {
+			continue
+		}
+		seen[uid] = struct{}{}
+		for c := range h.byUser[uid] {
+			out = append(out, c)
+		}
+	}
+	h.mu.RUnlock()
+	return out
+}
+
+func deliver(targets []*Client, raw []byte) {
+	for _, c := range targets {
+		func() {
+			// Guard against a concurrent Remove: never panic the broadcaster.
+			defer func() { _ = recover() }()
+			select {
+			case c.send <- raw:
+			default:
+			}
+		}()
+	}
+}
+
 // Broadcast sends to all connected sockets (best-effort, drops slow clients).
+// Kept for presence + rare room-list / retract events. High-frequency content
+// (DMs, room messages, feed posts) must use SendToUsers instead.
 func (h *Hub) Broadcast(msgType string, payload any) {
 	raw, err := json.Marshal(envelope{Type: msgType, Payload: payload})
 	if err != nil {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.clients {
-		select {
-		case c.send <- raw:
-		default:
-		}
+	deliver(h.snapshotAll(), raw)
+}
+
+// SendToUsers delivers only to the given user ids (all their tabs).
+// Talk/DM = exactly the 2 participants; room messages = member ids only.
+func (h *Hub) SendToUsers(userIDs []int64, msgType string, payload any) {
+	if len(userIDs) == 0 {
+		return
 	}
+	raw, err := json.Marshal(envelope{Type: msgType, Payload: payload})
+	if err != nil {
+		return
+	}
+	deliver(h.snapshotUsers(userIDs), raw)
+}
+
+// SendToUser is the single-recipient fast path (e.g. DM survivor retract).
+func (h *Hub) SendToUser(userID int64, msgType string, payload any) {
+	h.SendToUsers([]int64{userID}, msgType, payload)
 }
 
 // BroadcastPresenceOnline announces a user coming online, plus the
