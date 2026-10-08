@@ -15,6 +15,7 @@ type Config struct {
 	JWTSecret       string
 	PresenceTTL     int    // seconds a heartbeat keeps you online (default 60)
 	PresenceSweep   int    // reaper interval seconds (default 10)
+	PresenceGrace   int    // seconds after last-socket disconnect before offline teardown (default 10, 0 = reaper only)
 	RateLimits      bool   // false disables all rate limits (dev); default true
 	CORSOrigins     string // comma-separated allowed browser origins
 	FeedMaxPosts    int    // cap of live posts in feed:global (default 300)
@@ -93,6 +94,7 @@ func Load() Config {
 		JWTSecret:       getenv("JWT_SECRET", ""),
 		PresenceTTL:     getenvInt("PRESENCE_TTL_SEC", 60),
 		PresenceSweep:   getenvInt("PRESENCE_SWEEP_SEC", 10),
+		PresenceGrace:   getenvInt("PRESENCE_GRACE_SEC", 10),
 		RateLimits:      getenvBool("RATE_LIMITS_ENABLED", true),
 		CORSOrigins:     getenv("CORS_ORIGINS", "http://localhost:3000"),
 		FeedMaxPosts:    getenvInt("FEED_MAX_POSTS", 300),

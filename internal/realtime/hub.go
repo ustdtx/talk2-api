@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/redis/go-redis/v9"
@@ -100,6 +101,14 @@ func (h *Hub) Count() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.clients)
+}
+
+// UserConnected reports whether the user holds any socket (multi-tab safe:
+// one tab closing must not take a user with other tabs open offline).
+func (h *Hub) UserConnected(uid int64) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.byUser[uid]) > 0
 }
 
 // DisconnectUser closes all sockets of a user (logout / account delete).
@@ -214,12 +223,90 @@ func sendTo(c *Client, msgType string, payload any) {
 	}
 }
 
+// aliveThreshold is how fresh a heartbeat must be to prove liveness at a
+// grace fire. It must exceed the UI heartbeat cadence (20s WS + HTTP), so a
+// tab kept alive by HTTP heartbeats alone is never wiped by the fast path.
+const aliveThreshold = 25 * time.Second
+
 // Handler owns the /ws upgrade + read loop.
 type Handler struct {
 	Hub     *Hub
 	Tracker *presence.Tracker
 	Secret  string
 	Redis   *redis.Client
+	// Grace is the delay between last-socket disconnect and offline teardown.
+	// Reconnects (page reload, blips) cancel it; expiry runs OfflineHook.
+	// Zero disables the fast path (TTL reaper only, as before).
+	Grace time.Duration
+	// OfflineHook is the full offline teardown (content wipe + offline
+	// broadcast). Same function the presence reaper uses as backstop.
+	OfflineHook func(ctx context.Context, userID int64, username string)
+
+	mu      sync.Mutex
+	pending map[int64]*time.Timer
+}
+
+// CancelGrace drops a pending offline for the user (reconnect, HTTP
+// heartbeat, logout paths).
+func (h *Handler) CancelGrace(uid int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if t, ok := h.pending[uid]; ok {
+		t.Stop()
+		delete(h.pending, uid)
+	}
+}
+
+// HeartbeatSeen records an HTTP heartbeat: it proves liveness, so any pending
+// offline is cancelled; with no sockets left the watch re-arms instead of
+// leaving the user to the slow TTL reaper.
+func (h *Handler) HeartbeatSeen(uid int64, username string) {
+	h.CancelGrace(uid)
+	h.scheduleGrace(uid, username, aliveThreshold)
+}
+
+// scheduleGrace arms the offline countdown unless the user still holds a
+// socket (or one is already armed).
+func (h *Handler) scheduleGrace(uid int64, username string, d time.Duration) {
+	if d <= 0 || h.OfflineHook == nil {
+		return
+	}
+	if h.Hub == nil || h.Hub.UserConnected(uid) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, dup := h.pending[uid]; dup {
+		return
+	}
+	if h.pending == nil {
+		h.pending = make(map[int64]*time.Timer)
+	}
+	h.pending[uid] = time.AfterFunc(d, func() { h.fireGrace(uid, username) })
+}
+
+// fireGrace runs the offline teardown unless the user came back (socket) or a
+// heartbeat landed after disconnect (HTTP / racing socket): still alive, so
+// keep watching instead of wiping.
+func (h *Handler) fireGrace(uid int64, username string) {
+	h.mu.Lock()
+	delete(h.pending, uid)
+	h.mu.Unlock()
+	if h.Hub == nil || h.Hub.UserConnected(uid) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if h.Tracker != nil {
+		if last, err := h.Tracker.LastBeat(ctx, uid); err == nil && time.Since(last) < aliveThreshold {
+			h.scheduleGrace(uid, username, aliveThreshold)
+			return
+		}
+		h.Tracker.MarkOffline(ctx, uid)
+	}
+	if h.OfflineHook != nil {
+		h.OfflineHook(ctx, uid, username)
+	}
 }
 
 // ServeWS upgrades with JWT auth (query ?token= for browsers, else
@@ -254,13 +341,26 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c := &Client{UserID: claims.UserID, Username: claims.Username, conn: conn, send: make(chan []byte, 64)}
 	h.Hub.Add(c)
-	defer h.Hub.Remove(c)
+	h.CancelGrace(c.UserID)
+	markedOnline := false
+	defer func() {
+		h.Hub.Remove(c)
+		// Fast offline: last socket gone starts the grace countdown.
+		// Reloads and blips reconnect first and cancel it; the TTL reaper
+		// stays as backstop (e.g. server restart loses pending timers).
+		// NOTE: logout closes sockets too — its teardown double-fires here,
+		// harmless (idempotent wipe + duplicate offline broadcast).
+		if markedOnline {
+			h.scheduleGrace(c.UserID, c.Username, h.Grace)
+		}
+	}()
 
 	if err := h.Tracker.MarkOnline(ctx, c.UserID, c.Username); err != nil {
 		log.Printf("ws: mark online failed for %d: %v", c.UserID, err)
 		_ = conn.Close(websocket.StatusInternalError, "presence unavailable")
 		return
 	}
+	markedOnline = true
 	h.Hub.BroadcastPresenceOnline(c.UserID, c.Username)
 
 	online, _ := h.Tracker.ListOnline(ctx)

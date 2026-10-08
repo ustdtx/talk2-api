@@ -94,11 +94,21 @@ func main() {
 	} else {
 		log.Printf("presence: NOT configured (need REDIS_URL + JWT_SECRET) - /ws and /presence/* will 503")
 	}
-	rtH := &realtime.Handler{Hub: hub, Tracker: tracker, Secret: cfg.JWTSecret, Redis: rdb}
+	rtH := &realtime.Handler{
+		Hub:     hub,
+		Tracker: tracker,
+		Secret:  cfg.JWTSecret,
+		Redis:   rdb,
+		Grace:   time.Duration(cfg.PresenceGrace) * time.Second,
+		OfflineHook: func(ctx context.Context, uid int64, username string) {
+			onOffline(ctx, hub, feedStore, dmStore, roomStore, uid, username)
+		},
+	}
 	// Session teardown: logout/delete wipes content now (not on TTL lapse)
 	// and kills live sockets.
 	authH.Redis = rdb
 	authH.OnLogout = func(ctx context.Context, uid int64, username string) {
+		rtH.CancelGrace(uid)
 		onOffline(ctx, hub, feedStore, dmStore, roomStore, uid, username)
 		hub.DisconnectUser(uid, "logged out")
 	}
@@ -146,6 +156,9 @@ func main() {
 			// HTTP-only client (no socket): establish presence.
 			_ = tracker.MarkOnline(r.Context(), claims.UserID, claims.Username)
 		}
+		// An HTTP heartbeat proves liveness: cancel any pending fast-offline
+		// (reconnect racing a blip), or keep watching when socketless.
+		rtH.HeartbeatSeen(claims.UserID, claims.Username)
 		writeJSON(w, http.StatusOK, map[string]bool{"online": true})
 	}))
 

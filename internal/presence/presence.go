@@ -80,6 +80,17 @@ func (t *Tracker) IsOnline(ctx context.Context, uid int64) (bool, error) {
 	return n > 0, err
 }
 
+// LastBeat returns the most recent heartbeat (socket or HTTP) for the user.
+// The grace fast-path uses it to tell "tab just closed" (stale) from "tab
+// kept alive by HTTP heartbeats" (fresh) — never wipe the latter.
+func (t *Tracker) LastBeat(ctx context.Context, uid int64) (time.Time, error) {
+	v, err := t.rdb.HGet(ctx, key(uid), "last_heartbeat").Int64()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(v, 0), nil
+}
+
 // OnlineCount is the cheap crowd size for adaptive tuning (set cardinality
 // only — no hydration). Exact membership still comes from ListOnline.
 func (t *Tracker) OnlineCount(ctx context.Context) (int64, error) {
