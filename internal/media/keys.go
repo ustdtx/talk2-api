@@ -47,6 +47,9 @@ func DMImageKey(a, b, msgID string, idx int) string {
 	}
 	return fmt.Sprintf("dm/%s-%s/%s-%d.jpg", a, b, msgID, idx)
 }
+func RoomImageKey(roomID, msgID string, idx int) string {
+	return fmt.Sprintf("rooms/%s/%s-%d.jpg", roomID, msgID, idx)
+}
 
 // TmpKey for standalone uploads via POST /media/upload without a parent yet.
 func TmpKey(authorID, ext string) string {

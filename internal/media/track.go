@@ -46,7 +46,7 @@ func TrackPending(ctx context.Context, rdb *redis.Client, authorID int64, object
 }
 
 // MarkAttached points tracked keys at their parent entity.
-// parentType is one of posts|comments|dm; parentID is the entity id.
+// parentType is one of posts|comments|dm|rooms; parentID is the entity id.
 func MarkAttached(ctx context.Context, rdb *redis.Client, objectKey, parentType, parentID string) {
 	if rdb == nil || objectKey == "" {
 		return

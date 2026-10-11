@@ -88,7 +88,7 @@ func main() {
 			})
 		feedStore = feed.NewStore(rdb, tracker, store, cfg.RateLimits, cfg.FeedMaxPosts, cfg.FeedBatchMinSec, cfg.FeedBatchMaxSec)
 		dmStore = dm.NewStore(rdb, tracker, store, cfg.RateLimits)
-		roomStore = room.NewStore(rdb, tracker)
+		roomStore = room.NewStore(rdb, tracker, store)
 		go tracker.RunReaper(context.Background())
 		log.Printf("presence: redis connected (ttl=%ds sweep=%ds)", cfg.PresenceTTL, cfg.PresenceSweep)
 	} else {
