@@ -15,6 +15,7 @@ var validUsername = regexp.MustCompile(`^[a-zA-Z0-9_]{3,32}$`)
 var (
 	ErrBadUsername = errors.New("username must be 3-32 chars: letters, numbers, underscore")
 	ErrBadPassword = errors.New("password must be at least 8 characters")
+	ErrLongPassword = errors.New("password must be at most 72 bytes")
 )
 
 // NormalizeUsername trims and validates. Usernames are case-insensitively
@@ -30,6 +31,11 @@ func NormalizeUsername(raw string) (string, error) {
 func CheckPassword(raw string) error {
 	if len(raw) < 8 {
 		return ErrBadPassword
+	}
+	// bcrypt silently truncates past 72 bytes: two different long passwords
+	// sharing a 72-byte prefix would verify identically. Reject instead.
+	if len(raw) > 72 {
+		return ErrLongPassword
 	}
 	return nil
 }

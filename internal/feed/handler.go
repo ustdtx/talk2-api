@@ -61,9 +61,14 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 		mapStoreErr(w, err)
 		return
 	}
-	// Pull-based feed (scale): no global feed:new_post push. The author gets
-	// the POST response (optimistic) and everyone else polls GET /feed.
-	// Retracts (delete/offline) are still pushed — they are rare.
+	// Live push with client-side pacing: every post is broadcast to all
+	// sockets, but clients drain it through a paced reveal queue (time
+	// budget + adaptive rate + overflow pill), so a 100-posts/sec storm
+	// never forces 100 renders/sec on any device. Delivery is best-effort
+	// (slow clients drop, see Hub.deliver); REST stays source of truth and
+	// sealed batches stay the reconnect/catch-up path. Retracts are pushed
+	// too — they are rare.
+	h.Hub.Broadcast(realtime.EvFeedNewPost, p)
 	writeJSON(w, http.StatusCreated, p)
 }
 

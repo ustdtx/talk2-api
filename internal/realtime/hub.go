@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -234,6 +236,11 @@ type Handler struct {
 	Tracker *presence.Tracker
 	Secret  string
 	Redis   *redis.Client
+	// AllowedOrigins allow-lists the browser Origin header (wired from
+	// CORS_ORIGINS). Empty Origin (non-browser clients) is always allowed;
+	// browsers always send one, so spoofing past this gains nothing without
+	// a valid JWT anyway. Empty list = allow all (dev).
+	AllowedOrigins []string
 	// Grace is the delay between last-socket disconnect and offline teardown.
 	// Reconnects (page reload, blips) cancel it; expiry runs OfflineHook.
 	// Zero disables the fast path (TTL reaper only, as before).
@@ -309,14 +316,38 @@ func (h *Handler) fireGrace(uid int64, username string) {
 	}
 }
 
-// ServeWS upgrades with JWT auth (query ?token= for browsers, else
-// Authorization header). Origin is open for dev; lock down for prod.
+// tokenFromSubprotocol pulls the JWT from the Sec-WebSocket-Protocol
+// header (client offers "bearer.<jwt>"). Browsers can't set WS headers, but
+// they can offer subprotocols — unlike ?token= URLs, these never land in
+// access logs, proxies, or history.
+func tokenFromSubprotocol(r *http.Request) string {
+	for _, part := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		part = strings.TrimSpace(part)
+		if rest, ok := strings.CutPrefix(part, "bearer."); ok && rest != "" {
+			return rest
+		}
+	}
+	return ""
+}
+
+// ServeWS upgrades with JWT auth (subprotocol preferred, ?token= legacy
+// fallback, else Authorization header). Origin is checked against the
+// allow-list when configured.
 func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if h.Tracker == nil || h.Secret == "" {
 		http.Error(w, "realtime not configured", http.StatusServiceUnavailable)
 		return
 	}
-	raw := r.URL.Query().Get("token")
+	if len(h.AllowedOrigins) > 0 {
+		if origin := r.Header.Get("Origin"); origin != "" && !slices.Contains(h.AllowedOrigins, origin) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+	}
+	raw := tokenFromSubprotocol(r)
+	if raw == "" {
+		raw = r.URL.Query().Get("token")
+	}
 	if raw == "" {
 		ah := r.Header.Get("Authorization")
 		if len(ah) > 7 && (ah[:7] == "Bearer " || ah[:7] == "bearer ") {
