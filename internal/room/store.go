@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"talk2-api/internal/media"
 	"talk2-api/internal/presence"
 )
 
@@ -20,7 +22,15 @@ var (
 	ErrEmptyName = errors.New("room name cannot be empty")
 )
 
-const messageCap = 500
+const (
+	messageCap = 500
+	maxImages  = 4
+)
+
+type Image struct {
+	Key string `json:"key"`
+	URL string `json:"url"`
+}
 
 type Room struct {
 	ID              int64  `json:"id"`
@@ -31,12 +41,13 @@ type Room struct {
 }
 
 type Message struct {
-	ID             int64  `json:"id"`
-	RoomID         int64  `json:"room_id"`
-	AuthorID       int64  `json:"author_id"`
-	AuthorUsername string `json:"author_username"`
-	Text           string `json:"text"`
-	CreatedAt      string `json:"created_at"`
+	ID             int64   `json:"id"`
+	RoomID         int64   `json:"room_id"`
+	AuthorID       int64   `json:"author_id"`
+	AuthorUsername string  `json:"author_username"`
+	Text           string  `json:"text"`
+	Images         []Image `json:"images"`
+	CreatedAt      string  `json:"created_at"`
 }
 
 type WipeResult struct {
@@ -53,10 +64,11 @@ type MessageRef struct {
 type Store struct {
 	rdb      *redis.Client
 	presence *presence.Tracker
+	media    media.Storage
 }
 
-func NewStore(rdb *redis.Client, p *presence.Tracker) *Store {
-	return &Store{rdb: rdb, presence: p}
+func NewStore(rdb *redis.Client, p *presence.Tracker, m media.Storage) *Store {
+	return &Store{rdb: rdb, presence: p, media: m}
 }
 
 func roomKey(id int64) string       { return fmt.Sprintf("room:%d", id) }
@@ -72,6 +84,57 @@ func (s *Store) requireOnline(ctx context.Context, uid int64) error {
 		return ErrOffline
 	}
 	return nil
+}
+
+func encodeImages(keys []string, pub func(string) string) string {
+	imgs := make([]Image, 0, len(keys))
+	for _, k := range keys {
+		imgs = append(imgs, Image{Key: k, URL: pub(k)})
+	}
+	raw, _ := json.Marshal(imgs)
+	return string(raw)
+}
+
+func (s *Store) decodeImages(raw string) []Image {
+	if raw == "" {
+		return []Image{}
+	}
+	var imgs []Image
+	if err := json.Unmarshal([]byte(raw), &imgs); err != nil {
+		return []Image{}
+	}
+	for i := range imgs {
+		if imgs[i].URL == "" && imgs[i].Key != "" {
+			imgs[i].URL = s.media.PublicURL(imgs[i].Key)
+		}
+	}
+	return imgs
+}
+
+func imageKeys(imgs []Image) []string {
+	out := make([]string, 0, len(imgs))
+	for _, im := range imgs {
+		if im.Key != "" {
+			out = append(out, im.Key)
+		}
+	}
+	return out
+}
+
+// checkImages enforces count + ownership (keys must live under the author's
+// own tmp/ prefix, same as posts/comments/DMs).
+func checkImages(keys []string, uid int64) ([]string, error) {
+	if len(keys) > maxImages {
+		return nil, errors.New("max 4 images per message")
+	}
+	prefix := fmt.Sprintf("tmp/%d/", uid)
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" || !strings.HasPrefix(k, prefix) {
+			return nil, errors.New("image keys must be your own uploads (tmp/{your-id}/...)")
+		}
+	}
+	return keys, nil
 }
 
 func (s *Store) Create(ctx context.Context, uid int64, username, name string) (*Room, error) {
@@ -194,18 +257,22 @@ func (s *Store) GetMessages(ctx context.Context, uid, id int64) ([]Message, erro
 		}
 		author, _ := strconv.ParseInt(h["author_id"], 10, 64)
 		created, _ := strconv.ParseInt(h["created_at"], 10, 64)
-		out = append(out, Message{ID: mid, RoomID: id, AuthorID: author, AuthorUsername: h["author_username"], Text: h["text"], CreatedAt: time.UnixMilli(created).UTC().Format(time.RFC3339)})
+		out = append(out, Message{ID: mid, RoomID: id, AuthorID: author, AuthorUsername: h["author_username"], Text: h["text"], Images: s.decodeImages(h["images"]), CreatedAt: time.UnixMilli(created).UTC().Format(time.RFC3339)})
 	}
 	return out, nil
 }
 
-func (s *Store) Send(ctx context.Context, uid int64, username string, roomID int64, text string) (*Message, error) {
+func (s *Store) Send(ctx context.Context, uid int64, username string, roomID int64, text string, imgKeys []string) (*Message, error) {
 	if err := s.requireOnline(ctx, uid); err != nil {
 		return nil, err
 	}
+	imgKeys, err := checkImages(imgKeys, uid)
+	if err != nil {
+		return nil, err
+	}
 	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil, errors.New("text cannot be empty")
+	if text == "" && len(imgKeys) == 0 {
+		return nil, errors.New("say something or attach an image")
 	}
 	if ok, _ := s.rdb.SIsMember(ctx, membersKey(roomID), uid).Result(); !ok {
 		return nil, ErrNotMember
@@ -215,15 +282,24 @@ func (s *Store) Send(ctx context.Context, uid int64, username string, roomID int
 		return nil, err
 	}
 	now := time.Now().UnixMilli()
+	imgs := encodeImages(imgKeys, s.media.PublicURL)
 	pipe := s.rdb.Pipeline()
-	pipe.HSet(ctx, messageKey(id), map[string]any{"room_id": roomID, "author_id": uid, "author_username": username, "text": text, "created_at": now})
+	pipe.HSet(ctx, messageKey(id), map[string]any{"room_id": roomID, "author_id": uid, "author_username": username, "text": text, "images": imgs, "created_at": now})
 	pipe.ZAdd(ctx, messagesKey(roomID), redis.Z{Score: float64(now), Member: pad(id)})
 	pipe.SAdd(ctx, fmt.Sprintf("roommsgs:by_author:%d", uid), id)
+	if len(imgKeys) > 0 {
+		pipe.SAdd(ctx, fmt.Sprintf("media:by_author:%d", uid), imgKeys)
+	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, err
 	}
-	return &Message{ID: id, RoomID: roomID, AuthorID: uid, AuthorUsername: username, Text: text, CreatedAt: time.UnixMilli(now).UTC().Format(time.RFC3339)}, nil
+	for _, k := range imgKeys {
+		media.MarkAttached(ctx, s.rdb, k, "rooms", id2s(id))
+	}
+	return &Message{ID: id, RoomID: roomID, AuthorID: uid, AuthorUsername: username, Text: text, Images: s.decodeImages(imgs), CreatedAt: time.UnixMilli(now).UTC().Format(time.RFC3339)}, nil
 }
+
+func id2s(id int64) string { return strconv.FormatInt(id, 10) }
 
 func (s *Store) Leave(ctx context.Context, uid, id int64) (*WipeResult, error) {
 	if ok, _ := s.rdb.SIsMember(ctx, membersKey(id), uid).Result(); !ok {
@@ -238,6 +314,7 @@ func (s *Store) Leave(ctx context.Context, uid, id int64) (*WipeResult, error) {
 
 func (s *Store) removeUserMessages(ctx context.Context, uid, roomID int64, res *WipeResult) {
 	ids, _ := s.rdb.SMembers(ctx, fmt.Sprintf("roommsgs:by_author:%d", uid)).Result()
+	var r2keys []string
 	for _, raw := range ids {
 		mid, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -247,10 +324,16 @@ func (s *Store) removeUserMessages(ctx context.Context, uid, roomID int64, res *
 		if h["room_id"] != strconv.FormatInt(roomID, 10) {
 			continue
 		}
+		r2keys = append(r2keys, imageKeys(s.decodeImages(h["images"]))...)
 		s.rdb.ZRem(ctx, messagesKey(roomID), pad(mid))
 		s.rdb.Del(ctx, messageKey(mid))
 		s.rdb.SRem(ctx, fmt.Sprintf("roommsgs:by_author:%d", uid), mid)
 		res.DeletedMessages = append(res.DeletedMessages, MessageRef{RoomID: roomID, MessageID: mid})
+	}
+	if len(r2keys) > 0 {
+		s.rdb.SRem(ctx, fmt.Sprintf("media:by_author:%d", uid), r2keys)
+		_ = s.media.DeleteMany(ctx, r2keys)
+		media.Untrack(ctx, s.rdb, uid, r2keys)
 	}
 }
 
@@ -265,6 +348,8 @@ func (s *Store) removeIfEmpty(ctx context.Context, id int64, res *WipeResult) {
 		return
 	}
 	ids, _ := s.rdb.ZRange(ctx, messagesKey(id), 0, -1).Result()
+	var r2keys []string
+	var authors []int64
 	for _, raw := range ids {
 		mid, err := strconv.ParseInt(strings.TrimLeft(raw, "0"), 10, 64)
 		if err != nil || mid == 0 {
@@ -273,8 +358,20 @@ func (s *Store) removeIfEmpty(ctx context.Context, id int64, res *WipeResult) {
 		h, _ := s.rdb.HGetAll(ctx, messageKey(mid)).Result()
 		if author, err := strconv.ParseInt(h["author_id"], 10, 64); err == nil {
 			s.rdb.SRem(ctx, fmt.Sprintf("roommsgs:by_author:%d", author), mid)
+			authors = append(authors, author)
 		}
+		r2keys = append(r2keys, imageKeys(s.decodeImages(h["images"]))...)
 		s.rdb.Del(ctx, messageKey(mid))
+	}
+	// Safety-net GC (plan §11): leftover room images die with the empty room.
+	if len(r2keys) > 0 {
+		for _, a := range authors {
+			s.rdb.SRem(ctx, fmt.Sprintf("media:by_author:%d", a), r2keys)
+		}
+		_ = s.media.DeleteMany(ctx, r2keys)
+		for _, k := range r2keys {
+			s.rdb.Del(ctx, "media:"+k)
+		}
 	}
 	s.rdb.Del(ctx, roomKey(id), membersKey(id), messagesKey(id))
 	s.rdb.ZRem(ctx, "rooms:all", pad(id))

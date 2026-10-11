@@ -134,17 +134,18 @@ func decodeImages(raw string, pub func(string) string) []Image {
 }
 
 // Send stores a message. Both parties must be online, else 422.
+// Text may be empty when images are attached (standalone image messages).
 func (s *Store) Send(ctx context.Context, fromID int64, fromName string, toID int64, text string, imgKeys []string) (*Message, error) {
 	if toID == fromID {
 		return nil, ErrSelf
 	}
-	t, err := checkText(text)
+	imgKeys, err := checkImages(imgKeys, fromID)
 	if err != nil {
 		return nil, err
 	}
-	imgKeys, err = checkImages(imgKeys, fromID)
-	if err != nil {
-		return nil, err
+	t := strings.TrimSpace(text)
+	if t == "" && len(imgKeys) == 0 {
+		return nil, errors.New("say something or attach an image")
 	}
 	if ok, err := s.presence.IsOnline(ctx, fromID); err != nil || !ok {
 		return nil, ErrOffline

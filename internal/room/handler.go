@@ -45,7 +45,8 @@ type createBody struct {
 	Topic string `json:"topic"`
 }
 type messageBody struct {
-	Text string `json:"text"`
+	Text      string   `json:"text"`
+	ImageKeys []string `json:"image_keys"`
 }
 
 func roomID(r *http.Request) (int64, error) {
@@ -134,7 +135,7 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
-	msg, err := h.Store.Send(r.Context(), claims.UserID, claims.Username, id, b.Text)
+	msg, err := h.Store.Send(r.Context(), claims.UserID, claims.Username, id, b.Text, b.ImageKeys)
 	if err != nil {
 		h.mapErr(w, err)
 		return
