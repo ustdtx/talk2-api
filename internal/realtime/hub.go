@@ -319,15 +319,16 @@ func (h *Handler) fireGrace(uid int64, username string) {
 // tokenFromSubprotocol pulls the JWT from the Sec-WebSocket-Protocol
 // header (client offers "bearer.<jwt>"). Browsers can't set WS headers, but
 // they can offer subprotocols — unlike ?token= URLs, these never land in
-// access logs, proxies, or history.
-func tokenFromSubprotocol(r *http.Request) string {
+// access logs, proxies, or history. Returns the full offered protocol (for
+// the Accept echo) and the token itself.
+func tokenFromSubprotocol(r *http.Request) (proto, token string) {
 	for _, part := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
 		part = strings.TrimSpace(part)
 		if rest, ok := strings.CutPrefix(part, "bearer."); ok && rest != "" {
-			return rest
+			return part, rest
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // ServeWS upgrades with JWT auth (subprotocol preferred, ?token= legacy
@@ -344,7 +345,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	raw := tokenFromSubprotocol(r)
+	raw, proto := tokenFromSubprotocol(r)
 	if raw == "" {
 		raw = r.URL.Query().Get("token")
 	}
@@ -365,7 +366,15 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+	// Echo the offered subprotocol back: strict clients (Node, native
+	// stacks) fail the handshake when the server selects nothing, even
+	// though browsers tolerate it. Query-authed clients offered nothing,
+	// so only echo when the client actually offered it.
+	var subprotocols []string
+	if proto != "" {
+		subprotocols = []string{proto}
+	}
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}, Subprotocols: subprotocols})
 	if err != nil {
 		return
 	}
