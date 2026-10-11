@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -395,7 +396,13 @@ func main() {
 		}()
 	}
 
-	// Root hint.
+	// Root hint. build is the deployed commit (Render injects
+	// RENDER_GIT_COMMIT; empty locally) so anyone can fingerprint which
+	// build is actually running without guessing at deploy lag.
+	build := os.Getenv("RENDER_GIT_COMMIT")
+	if len(build) > 12 {
+		build = build[:12]
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -406,6 +413,7 @@ func main() {
 			"health":  "/healthz",
 			"ready":   "/readyz",
 			"upload":  "POST /media/upload (multipart: key?, file)",
+			"build":   build,
 		})
 	})
 
