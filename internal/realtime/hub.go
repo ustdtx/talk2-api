@@ -446,22 +446,30 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	raw, proto := tokenFromSubprotocol(r)
-	if raw == "" {
-		raw = r.URL.Query().Get("token")
+	// Try each credential source in order. A proxy in front of us may
+	// mangle or truncate the subprotocol header, so a garbage token there
+	// must not shadow a perfectly good ?token= / Authorization credential.
+	candidates := []string{raw, r.URL.Query().Get("token")}
+	if ah := r.Header.Get("Authorization"); len(ah) > 7 && (ah[:7] == "Bearer " || ah[:7] == "bearer ") {
+		candidates = append(candidates, ah[7:])
 	}
-	if raw == "" {
-		ah := r.Header.Get("Authorization")
-		if len(ah) > 7 && (ah[:7] == "Bearer " || ah[:7] == "bearer ") {
-			raw = ah[7:]
+	var claims *auth.Claims
+	used := ""
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		if cl, err := auth.ParseToken(h.Secret, cand); err == nil {
+			claims, used = cl, cand
+			break
 		}
 	}
-	claims, err := auth.ParseToken(h.Secret, raw)
-	if err != nil {
+	if claims == nil {
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 		return
 	}
 	if h.Redis != nil {
-		if n, _ := h.Redis.Exists(r.Context(), auth.DeniedKey(raw)).Result(); n > 0 {
+		if n, _ := h.Redis.Exists(r.Context(), auth.DeniedKey(used)).Result(); n > 0 {
 			http.Error(w, "logged out", http.StatusUnauthorized)
 			return
 		}
