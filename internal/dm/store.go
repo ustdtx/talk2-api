@@ -234,8 +234,15 @@ func (s *Store) ListThreads(ctx context.Context, uid int64) ([]Thread, error) {
 		}
 		created, _ := strconv.ParseInt(hm["created_at"], 10, 64)
 		n, _ := s.rdb.ZCard(ctx, threadKey(uid, vid)).Result()
+		lastText := hm["text"]
+		if strings.TrimSpace(lastText) == "" {
+			var im []Image
+			if _ = json.Unmarshal([]byte(hm["images"]), &im); len(im) > 0 {
+				lastText = "📷 sent an image"
+			}
+		}
 		tmp = append(tmp, scored{t: Thread{WithUserID: vid, WithUsername: name,
-			LastText: hm["text"], LastAt: time.UnixMilli(created).UTC().Format(time.RFC3339),
+			LastText: lastText, LastAt: time.UnixMilli(created).UTC().Format(time.RFC3339),
 			MessageCount: int(n)}, ms: created})
 	}
 	out := make([]Thread, 0, len(tmp))
