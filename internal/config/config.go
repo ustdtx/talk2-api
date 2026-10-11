@@ -19,8 +19,6 @@ type Config struct {
 	RateLimits      bool   // false disables all rate limits (dev); default true
 	CORSOrigins     string // comma-separated allowed browser origins
 	FeedMaxPosts    int    // cap of live posts in feed:global (default 300)
-	FeedBatchMinSec int64  // shortest batch window: quiet crowds stay fresh (default 15)
-	FeedBatchMaxSec int64  // longest batch window: packed crowds stay efficient (default 300)
 	S3Bucket        string
 	S3Region        string
 	S3EndpointURL   string
@@ -98,8 +96,6 @@ func Load() Config {
 		RateLimits:      getenvBool("RATE_LIMITS_ENABLED", true),
 		CORSOrigins:     getenv("CORS_ORIGINS", "http://localhost:3000"),
 		FeedMaxPosts:    getenvInt("FEED_MAX_POSTS", 300),
-		FeedBatchMinSec: int64(getenvInt("FEED_BATCH_MIN_SEC", 15)),
-		FeedBatchMaxSec: int64(getenvInt("FEED_BATCH_MAX_SEC", 300)),
 		S3Bucket:        getenv("S3_BUCKET", ""),
 		S3Region:        getenv("S3_REGION", "auto"),
 		S3EndpointURL:   getenv("S3_ENDPOINT_URL", ""),
