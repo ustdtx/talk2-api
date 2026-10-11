@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,6 +45,66 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// authLimiter is a tiny in-memory rate limiter for the auth endpoints.
+// Login/register run bcrypt (CPU-expensive by design), so unbounded attempts
+// are both a credential-stuffing vector and a CPU-burn DoS vector. Sliding
+// window per key; opportunistic cleanup keeps the map bounded. Single-process
+// scope is fine for v1 (one pod holds all auth traffic behind Fly routing;
+// revisit with a Redis token bucket when multi-pod lands).
+var authLimiter = struct {
+	sync.Mutex
+	hits map[string][]time.Time
+}{hits: map[string][]time.Time{}}
+
+func authAllowed(key string, max int, window time.Duration) bool {
+	now := time.Now()
+	authLimiter.Lock()
+	defer authLimiter.Unlock()
+	kept := authLimiter.hits[key][:0]
+	for _, t := range authLimiter.hits[key] {
+		if now.Sub(t) < window {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= max {
+		authLimiter.hits[key] = kept
+		return false
+	}
+	authLimiter.hits[key] = append(kept, now)
+	if len(authLimiter.hits) > 10000 {
+		for k, v := range authLimiter.hits {
+			if len(v) == 0 || now.Sub(v[len(v)-1]) > window {
+				delete(authLimiter.hits, k)
+			}
+		}
+	}
+	return true
+}
+
+// clientIP prefers the leftmost X-Forwarded-For entry (Fly terminates TLS at
+// the edge and appends it) and falls back to the connection address.
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if host, _, err := net.SplitHostPort(strings.TrimSpace(strings.Split(fwd, ",")[0]) + ":0"); err == nil {
+			return host
+		}
+		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// limitAuth rejects with 429 when the key exceeds max attempts per window.
+func limitAuth(w http.ResponseWriter, r *http.Request, key string, max int, window time.Duration) bool {
+	if !authAllowed(key, max, window) {
+		writeErr(w, http.StatusTooManyRequests, "too many attempts, slow down")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) dbOK(w http.ResponseWriter) bool {
 	if h.DB == nil || h.Secret == "" {
 		writeErr(w, http.StatusServiceUnavailable, "auth not configured (database/JWT_SECRET)")
@@ -53,6 +116,9 @@ func (h *Handler) dbOK(w http.ResponseWriter) bool {
 // POST /auth/register { username, password } -> 201 { user, token }
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if !h.dbOK(w) {
+		return
+	}
+	if !limitAuth(w, r, "register:"+clientIP(r), 10, time.Minute) {
 		return
 	}
 	var c credentials
@@ -99,9 +165,17 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if !h.dbOK(w) {
 		return
 	}
+	if !limitAuth(w, r, "login:"+clientIP(r), 10, time.Minute) {
+		return
+	}
 	var c credentials
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&c); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	// Per-account bucket on top of the per-IP one: slows targeted stuffing
+	// against a single username spread across many source IPs.
+	if !limitAuth(w, r, "login:user:"+strings.ToLower(strings.TrimSpace(c.Username)), 10, time.Minute) {
 		return
 	}
 	username := strings.TrimSpace(c.Username)

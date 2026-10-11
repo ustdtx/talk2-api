@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"talk2-api/internal/auth"
@@ -103,6 +104,11 @@ func main() {
 		OfflineHook: func(ctx context.Context, uid int64, username string) {
 			onOffline(ctx, hub, feedStore, dmStore, roomStore, uid, username)
 		},
+	}
+	for _, o := range strings.Split(cfg.CORSOrigins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			rtH.AllowedOrigins = append(rtH.AllowedOrigins, o)
+		}
 	}
 	// Session teardown: logout/delete wipes content now (not on TTL lapse)
 	// and kills live sockets.
@@ -346,9 +352,23 @@ func main() {
 	// (plan §11 orphan guard: uploaded but never attached). R2 lifecycle on
 	// prefix tmp/ should mirror this in Cloudflare as backup. Runs nightly
 	// in-process too (see ticker below); this endpoint allows manual run.
+	// Cooldown (60s, process-wide): the sweep SCANs the media index, so one
+	// authed user must not be able to burn Redis by hammering it.
+	var sweepMu sync.Mutex
+	var sweepLast time.Time
 	mux.HandleFunc("/media/sweep", authH.Authenticate(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sweepMu.Lock()
+		cool := time.Since(sweepLast) < time.Minute
+		if !cool {
+			sweepLast = time.Now()
+		}
+		sweepMu.Unlock()
+		if cool {
+			http.Error(w, "sweep cooling down, try again later", http.StatusTooManyRequests)
 			return
 		}
 		if rdb == nil {
