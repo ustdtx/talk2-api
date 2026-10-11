@@ -76,6 +76,10 @@ func main() {
 	// Presence + realtime (TASK-2). Degraded without Redis/JWT.
 	hub := realtime.NewHub()
 	rdb := presence.Client(cfg.RedisURL)
+	// Cross-pod fanout: every pod publishes its broadcasts to Redis and
+	// relays others' to its own sockets, so retracts/presence reach viewers
+	// no matter which pod handled the originating request. Nil-safe.
+	hub.AttachRedis(rdb)
 	var tracker *presence.Tracker
 	var feedStore *feed.Store
 	var dmStore *dm.Store

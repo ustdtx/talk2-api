@@ -1,11 +1,18 @@
 package realtime
 
-// Hub is the per-process socket registry.
-// Single-pod now (dev); multi-pod fan-out moves to NATS in TASK-7,
-// the broadcast surface (Broadcast) stays the same.
+// Hub is the per-process socket registry, with Redis pub/sub fanout across
+// pods. Local delivery is synchronous (same as before); every Broadcast /
+// SendToUsers is additionally published so pods that didn't handle the
+// originating request still push to their own sockets. Without this, a
+// logout landing on pod B wipes Redis globally but only pod B's sockets hear
+// the retracts — viewers on pod A keep the dead post until refresh.
+// (This is the TASK-7 fanout, done over the Redis we already run instead of
+// adding NATS.)
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -64,10 +71,92 @@ type Hub struct {
 	mu      sync.RWMutex
 	clients map[*Client]struct{}
 	byUser  map[int64]map[*Client]struct{}
+	// rdb/podID enable cross-pod fanout (nil rdb = single-process mode).
+	rdb   *redis.Client
+	podID string
 }
 
 func NewHub() *Hub {
 	return &Hub{clients: map[*Client]struct{}{}, byUser: map[int64]map[*Client]struct{}{}}
+}
+
+// fanoutTopic carries every broadcast to every pod.
+const fanoutTopic = "talk2:fanout"
+
+// fanoutMsg is the cross-pod envelope. To == nil means all local clients;
+// Disconnect != 0 is a control message (close that user's local sockets).
+type fanoutMsg struct {
+	Pod        string          `json:"pod"`
+	Type       string          `json:"type,omitempty"`
+	To         []int64         `json:"to,omitempty"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	Disconnect int64           `json:"disconnect,omitempty"`
+}
+
+// AttachRedis joins the pod mesh. Safe to call once at startup; nil is a
+// no-op (dev without Redis stays single-process).
+func (h *Hub) AttachRedis(rdb *redis.Client) {
+	if rdb == nil {
+		return
+	}
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	h.podID = hex.EncodeToString(b[:])
+	h.rdb = rdb
+	go h.runFanout()
+}
+
+// runFanout relays other pods' broadcasts to local sockets, resubscribing
+// forever (a dropped subscription must never leave a pod permanently deaf).
+func (h *Hub) runFanout() {
+	for {
+		sub := h.rdb.Subscribe(context.Background(), fanoutTopic)
+		if _, err := sub.Receive(context.Background()); err != nil {
+			log.Printf("fanout: subscribe failed (%v), retrying", err)
+			_ = sub.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		for raw := range sub.Channel() {
+			var m fanoutMsg
+			if err := json.Unmarshal([]byte(raw.Payload), &m); err != nil {
+				continue
+			}
+			if m.Pod == h.podID {
+				continue // own publish; already delivered locally
+			}
+			if m.Disconnect != 0 {
+				h.closeLocalUser(m.Disconnect, "logged out")
+				continue
+			}
+			env, err := json.Marshal(envelope{Type: m.Type, Payload: m.Payload})
+			if err != nil {
+				continue
+			}
+			if len(m.To) == 0 {
+				deliver(h.snapshotAll(), env)
+			} else {
+				deliver(h.snapshotUsers(m.To), env)
+			}
+		}
+		_ = sub.Close()
+		log.Printf("fanout: channel closed, resubscribing")
+		time.Sleep(time.Second)
+	}
+}
+
+func (h *Hub) publishFanout(m fanoutMsg) {
+	if h.rdb == nil {
+		return
+	}
+	m.Pod = h.podID
+	b, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	// Best-effort, synchronous: local sockets were already served first,
+	// so a slow Redis only delays the other pods, never this response.
+	_ = h.rdb.Publish(context.Background(), fanoutTopic, b).Err()
 }
 
 func (h *Hub) Add(c *Client) {
@@ -111,9 +200,15 @@ func (h *Hub) UserConnected(uid int64) bool {
 	return len(h.byUser[uid]) > 0
 }
 
-// DisconnectUser closes all sockets of a user (logout / account delete).
+// DisconnectUser closes all sockets of a user (logout / account delete),
+// on this pod and every other pod via fanout.
 // Map cleanup happens in each conn's deferred Remove; this only closes.
 func (h *Hub) DisconnectUser(uid int64, reason string) {
+	h.closeLocalUser(uid, reason)
+	h.publishFanout(fanoutMsg{Disconnect: uid})
+}
+
+func (h *Hub) closeLocalUser(uid int64, reason string) {
 	h.mu.RLock()
 	var targets []*Client
 	for c := range h.byUser[uid] {
@@ -168,8 +263,8 @@ func deliver(targets []*Client, raw []byte) {
 	}
 }
 
-// Broadcast sends to all connected sockets (best-effort, drops slow clients).
-// Kept for presence + rare room-list / retract events. High-frequency content
+// Broadcast sends to all connected sockets (best-effort, drops slow clients),
+// on this pod plus every other pod via fanout. High-frequency content
 // (DMs, room messages, feed posts) must use SendToUsers instead.
 func (h *Hub) Broadcast(msgType string, payload any) {
 	raw, err := json.Marshal(envelope{Type: msgType, Payload: payload})
@@ -177,9 +272,13 @@ func (h *Hub) Broadcast(msgType string, payload any) {
 		return
 	}
 	deliver(h.snapshotAll(), raw)
+	if pm, err := json.Marshal(payload); err == nil {
+		h.publishFanout(fanoutMsg{Type: msgType, Payload: pm})
+	}
 }
 
-// SendToUsers delivers only to the given user ids (all their tabs).
+// SendToUsers delivers only to the given user ids (all their tabs),
+// on this pod plus every other pod via fanout.
 // Talk/DM = exactly the 2 participants; room messages = member ids only.
 func (h *Hub) SendToUsers(userIDs []int64, msgType string, payload any) {
 	if len(userIDs) == 0 {
@@ -190,6 +289,9 @@ func (h *Hub) SendToUsers(userIDs []int64, msgType string, payload any) {
 		return
 	}
 	deliver(h.snapshotUsers(userIDs), raw)
+	if pm, err := json.Marshal(payload); err == nil {
+		h.publishFanout(fanoutMsg{Type: msgType, To: userIDs, Payload: pm})
+	}
 }
 
 // SendToUser is the single-recipient fast path (e.g. DM survivor retract).
