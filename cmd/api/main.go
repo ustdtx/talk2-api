@@ -87,7 +87,7 @@ func main() {
 			func(ctx context.Context, uid int64, username string) {
 				onOffline(ctx, hub, feedStore, dmStore, roomStore, uid, username)
 			})
-		feedStore = feed.NewStore(rdb, tracker, store, cfg.RateLimits, cfg.FeedMaxPosts, cfg.FeedBatchMinSec, cfg.FeedBatchMaxSec)
+		feedStore = feed.NewStore(rdb, tracker, store, cfg.RateLimits, cfg.FeedMaxPosts)
 		dmStore = dm.NewStore(rdb, tracker, store, cfg.RateLimits)
 		roomStore = room.NewStore(rdb, tracker, store)
 		go tracker.RunReaper(context.Background())
@@ -181,7 +181,6 @@ func main() {
 	}
 	mux.HandleFunc("POST /posts", requireFeed(feedH.CreatePost))
 	mux.HandleFunc("GET /feed", requireFeed(feedH.ListFeed))
-	mux.HandleFunc("GET /feed/batches", requireFeed(feedH.ListBatches))
 	mux.HandleFunc("GET /posts/{id}", requireFeed(feedH.GetPost))
 	mux.HandleFunc("DELETE /posts/{id}", requireFeed(feedH.DeletePost))
 	mux.HandleFunc("POST /posts/{id}/comments", requireFeed(feedH.AddComment))
@@ -379,55 +378,6 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "count": len(deleted)})
 	}))
 
-	// Feed timing loop: seal ticks + adaptive windows.
-	// Windows follow crowd size — short when quiet (fresh), long when packed
-	// (efficient). At most one window change per few minutes (no flapping);
-	// renumbering after a change is silent and clients rebase losslessly.
-	if feedStore != nil && tracker != nil {
-		go func() {
-			announced := feedStore.CurrentBatch() - 1
-			var lastWindowChange time.Time
-			tune := func() {
-				n, err := tracker.OnlineCount(context.Background())
-				if err != nil {
-					return
-				}
-				want := feed.DesiredWindow(n, cfg.FeedBatchMinSec, cfg.FeedBatchMaxSec)
-				if want == feedStore.WindowSec() {
-					return
-				}
-				if time.Since(lastWindowChange) < 3*time.Minute {
-					return
-				}
-				feedStore.SetWindowSec(want)
-				lastWindowChange = time.Now()
-				announced = feedStore.CurrentBatch() - 1
-				hub.Broadcast(realtime.EvFeedWindowChanged, map[string]any{"window_sec": want})
-				log.Printf("feed: window %ds for %d online", want, n)
-			}
-			tune()
-			sealTick := time.NewTicker(10 * time.Second)
-			defer sealTick.Stop()
-			tuneTick := time.NewTicker(30 * time.Second)
-			defer tuneTick.Stop()
-			for {
-				select {
-				case <-sealTick.C:
-					batch, ok := feedStore.SealCheck(context.Background(), announced)
-					if batch <= announced {
-						continue
-					}
-					announced = batch
-					if ok {
-						hub.Broadcast(realtime.EvFeedBatchSealed, map[string]any{"batch": batch})
-						log.Printf("feed: sealed batch %d", batch)
-					}
-				case <-tuneTick.C:
-					tune()
-				}
-			}
-		}()
-	}
 	// Nightly orphan sweeper (plan §11). Hourly tick, 24h age gate inside.
 	if rdb != nil {
 		go func() {

@@ -35,8 +35,6 @@ const (
 	EvError          = "error"
 
 	EvFeedNewPost          = "feed:new_post"
-	EvFeedBatchSealed      = "feed:batch_sealed"
-	EvFeedWindowChanged    = "feed:window_changed"
 	EvPostRetracted        = "post:retracted"
 	EvCommentNew           = "comment:new"
 	EvCommentRetracted     = "comment:retracted"
